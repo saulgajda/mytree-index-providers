@@ -9,18 +9,18 @@
     "metryki wolyn",
     "mytree"
   ],
-  "homepage": "https://github.com/saulgajda/mytree-index-providers",
+  "homepage": "https://github.com/mytree-project/index-providers",
   "license": "Apache-2.0",
   "authors": [
     {
       "name": "saulgajda",
-      "homepage": "https://github.com/saulgajda",
+      "homepage": "https://github.com/mytree-project",
       "role": "Developer"
     }
   ],
   "support": {
-    "issues": "https://github.com/saulgajda/mytree-index-providers/issues",
-    "source": "https://github.com/saulgajda/mytree-index-providers"
+    "issues": "https://github.com/mytree-project/index-providers/issues",
+    "source": "https://github.com/mytree-project/index-providers"
   },
   "require": {
     "php": "^8.2"
