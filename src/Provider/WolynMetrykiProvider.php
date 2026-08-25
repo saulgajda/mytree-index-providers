@@ -11,6 +11,7 @@ use MyTree\IndexProviders\Contracts\RecordWriterInterface;
 use MyTree\IndexProviders\Domain\AcquisitionStats;
 use MyTree\IndexProviders\Domain\AvailableParish;
 use MyTree\IndexProviders\Domain\ExternalIndexRecord;
+use MyTree\IndexProviders\Domain\ValueRepresentation;
 use MyTree\IndexProviders\Storage\RawResponseStore;
 use MyTree\IndexProviders\Support\NullProgressReporter;
 use MyTree\IndexProviders\Support\RateLimiter;
@@ -257,7 +258,28 @@ final class WolynMetrykiProvider
                 'duplicate_ordinal' => $duplicateOrdinal,
                 'id_strategy' => 'content_fingerprint_plus_duplicate_ordinal',
             ],
+            representation: ValueRepresentation::indexerRendering(
+                provider: 'wolyn-metryki',
+                indexedBy: $this->indexerFromFields($fields),
+            ),
         );
+    }
+
+    /** @param array<string,mixed> $fields */
+    private function indexerFromFields(array $fields): ?string
+    {
+        $candidate = $fields['indexed_by_raw'] ?? null;
+        if (!is_string($candidate)) {
+            $locator = $fields['source_locator'] ?? null;
+            $candidate = is_array($locator) ? ($locator['indexed_by_raw'] ?? null) : null;
+        }
+
+        if (!is_string($candidate)) {
+            return null;
+        }
+
+        $candidate = trim($candidate);
+        return $candidate !== '' ? $candidate : null;
     }
 
     /** @param list<string> $c @param list<list<string>> $h @return array<string,mixed> */

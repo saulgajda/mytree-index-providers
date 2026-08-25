@@ -11,6 +11,7 @@ use MyTree\IndexProviders\Contracts\RecordWriterInterface;
 use MyTree\IndexProviders\Domain\AcquisitionStats;
 use MyTree\IndexProviders\Domain\AvailableParish;
 use MyTree\IndexProviders\Domain\ExternalIndexRecord;
+use MyTree\IndexProviders\Domain\ValueRepresentation;
 use MyTree\IndexProviders\Storage\RawResponseStore;
 use MyTree\IndexProviders\Support\HtmlSelectParser;
 use MyTree\IndexProviders\Support\NullProgressReporter;
@@ -480,6 +481,10 @@ final class GenetekaProvider
                 'provider_record_gid' => $metadata['gid'] ?? null,
                 'id_strategy' => isset($metadata['gid']) ? 'geneteka_gid' : 'page_row_content_fallback',
             ],
+            representation: ValueRepresentation::indexerRendering(
+                provider: 'geneteka',
+                indexedBy: isset($metadata['indexed_by']) ? (string) $metadata['indexed_by'] : null,
+            ),
         );
     }
 

@@ -12,6 +12,7 @@ final readonly class ExternalIndexRecord implements JsonSerializable
      * @param array<string,mixed> $fields Structured but source-faithful fields.
      * @param array<string,mixed> $raw Raw source values/cells retained without semantic interpretation.
      * @param array<string,mixed> $provenance Acquisition and locator metadata.
+     * @param ValueRepresentation|null $representation Semantic status of provider-published descriptive values.
      */
     public function __construct(
         public string $provider,
@@ -22,6 +23,7 @@ final readonly class ExternalIndexRecord implements JsonSerializable
         public array $fields,
         public array $raw,
         public array $provenance,
+        public ?ValueRepresentation $representation = null,
     ) {
     }
 
@@ -38,6 +40,7 @@ final readonly class ExternalIndexRecord implements JsonSerializable
             'fields' => $this->fields,
             'raw' => $this->raw,
             'provenance' => $this->provenance,
+            'representation' => $this->representation,
         ];
     }
 }

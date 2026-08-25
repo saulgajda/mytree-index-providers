@@ -125,6 +125,10 @@ foreach ($lines as $line) {
 }
 ok(($birth['fields']['child']['given_names_raw'] ?? null) === 'Joanna', 'Wołyń birth mapping keeps child name.');
 ok(($birth['fields']['source_locator']['scan_url'] ?? null) === 'https://example.test/birth', 'Wołyń birth mapping keeps scan URL.');
+ok(($birth['representation']['kind'] ?? null) === 'indexer_rendering', 'Wołyń marks indexed values as indexer rendering.');
+ok(($birth['representation']['verbatim_from_provider'] ?? null) === true, 'Wołyń marks indexed values as verbatim from provider.');
+ok(($birth['representation']['producer']['indexer_id'] ?? null) === 'DM', 'Wołyń representation keeps indexer identity.');
+ok(($birth['representation']['original_document_wording_asserted'] ?? null) === false, 'Wołyń does not assert original-document wording.');
 
 // Geneteka provider end-to-end with one page.
 $genetekaRow = [
@@ -147,6 +151,9 @@ ok($genHttp->calls === 1, 'Geneteka single-page acquisition performs one HTTP re
 $genLine = json_decode((string) file_get_contents($genDir . '/records.jsonl'), true);
 ok(($genLine['provider_record_id'] ?? null) === '12309516', 'Geneteka uses gid as provider_record_id when available.');
 ok(($genLine['fields']['person']['mother_surname_raw'] ?? null) === 'Dzjurbjel', 'Geneteka person mapping keeps mother surname.');
+ok(($genLine['representation']['kind'] ?? null) === 'indexer_rendering', 'Geneteka marks indexed values as indexer rendering.');
+ok(($genLine['representation']['producer']['indexer_id'] ?? null) === 'karpecki.lukasz', 'Geneteka representation keeps indexer identity.');
+ok(($genLine['representation']['original_document_wording_asserted'] ?? null) === false, 'Geneteka does not assert original-document wording.');
 
 // Resume should not call HTTP again.
 $genWriter2 = new JsonlWriter($genDir . '/records.jsonl', true);
