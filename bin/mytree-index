@@ -1,0 +1,292 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use MyTree\IndexProviders\Domain\AvailableParish;
+use MyTree\IndexProviders\Http\NativeHttpClient;
+use MyTree\IndexProviders\Provider\GenetekaProvider;
+use MyTree\IndexProviders\Provider\WolynMetrykiProvider;
+use MyTree\IndexProviders\Storage\JsonCheckpointStore;
+use MyTree\IndexProviders\Storage\RawResponseStore;
+use MyTree\IndexProviders\Support\ConsoleProgressReporter;
+use MyTree\IndexProviders\Support\RateLimiter;
+use MyTree\IndexProviders\Writer\JsonlWriter;
+
+function usage(int $exitCode = 0): never
+{
+    $text = <<<'TXT'
+MyTree Index Providers — standalone CLI
+
+Download indexes — Geneteka:
+  php bin/mytree-index geneteka \
+    --region=06mp --parish-id=4812 --parish=Imbramowice \
+    --types=B,S,D --output=var/imbramowice
+
+Download indexes — Metryki-Wołyń:
+  php bin/mytree-index wolyn \
+    --parish=Szumsk --from=1731 --to=1943 \
+    --output=var/szumsk
+
+Discover available parishes — Geneteka, one region:
+  php bin/mytree-index geneteka --list-parishes --region=06mp
+
+Discover available parishes — Geneteka, all regions:
+  php bin/mytree-index geneteka --list-parishes --all-regions
+
+Discover available parishes — Metryki-Wołyń:
+  php bin/mytree-index wolyn --list-parishes
+
+Discovery options:
+  --list-parishes   Return available parishes instead of downloading indexes
+  --all-regions     Geneteka only: discover parishes in every region
+  --format=table    table (default), json or jsonl
+  --save=FILE       Additionally save discovery result to FILE
+  --refresh         Ignore cached discovery pages and fetch them again
+  --output=DIR      Optional discovery cache directory (default var/discovery-cache)
+
+Common acquisition options:
+  --delay-ms=2000   Minimum delay between network requests (default 2000)
+  --timeout=60      HTTP timeout in seconds
+  --restart         Ignore checkpoints/cache, truncate records.jsonl and fetch again
+  --help            Show this help
+
+Geneteka acquisition options:
+  --region=...      Region code, e.g. 06mp
+  --parish-id=...   Geneteka rid, e.g. 4812
+  --parish=...      Human-readable parish name (stored as requested metadata)
+  --types=B,S,D     Comma-separated record types
+  --page-size=50    Page size (default 50)
+
+Metryki-Wołyń acquisition options:
+  --parish=...      Parish name, e.g. Szumsk
+  --from=YYYY       First year
+  --to=YYYY         Last year
+TXT;
+    fwrite($exitCode === 0 ? STDOUT : STDERR, $text . PHP_EOL);
+    exit($exitCode);
+}
+
+/** @return array<string,string|bool> */
+function parseOptions(array $args): array
+{
+    $out = [];
+    foreach ($args as $arg) {
+        if (!str_starts_with($arg, '--')) {
+            continue;
+        }
+        $arg = substr($arg, 2);
+        if (str_contains($arg, '=')) {
+            [$key, $value] = explode('=', $arg, 2);
+            $out[$key] = $value;
+        } else {
+            $out[$arg] = true;
+        }
+    }
+    return $out;
+}
+
+function required(array $options, string $key): string
+{
+    $value = $options[$key] ?? null;
+    if (!is_string($value) || trim($value) === '') {
+        fwrite(STDERR, "Missing required option --$key\n");
+        usage(2);
+    }
+    return trim($value);
+}
+
+/** @param array<string,mixed> $data */
+function writeJson(string $path, array $data): void
+{
+    $dir = dirname($path);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0775, true);
+    }
+    file_put_contents($path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL);
+}
+
+/** @param list<AvailableParish> $parishes */
+function renderParishes(array $parishes, string $format): string
+{
+    $rows = array_map(static fn (AvailableParish $p): array => $p->toArray(), $parishes);
+    if ($format === 'json') {
+        return json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL;
+    }
+    if ($format === 'jsonl') {
+        return implode('', array_map(
+            static fn (array $row): string => json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL,
+            $rows,
+        ));
+    }
+    if ($format !== 'table') {
+        throw new InvalidArgumentException('Unsupported --format. Use table, json or jsonl.');
+    }
+
+    if ($parishes === []) {
+        return "No parishes found.\n";
+    }
+    $isGeneteka = $parishes[0]->provider === 'geneteka';
+    if ($isGeneteka) {
+        $header = ['REGION', 'ID', 'PARISH'];
+        $data = array_map(static fn (AvailableParish $p): array => [$p->regionCode ?? '', $p->providerParishId ?? '', $p->name], $parishes);
+    } else {
+        $header = ['PARISH', 'BIRTHS', 'MARRIAGES', 'DEATHS', 'CENSUS'];
+        $data = array_map(static function (AvailableParish $p): array {
+            $entries = is_array($p->metadata['wpisy'] ?? null) ? $p->metadata['wpisy'] : [];
+            return [
+                $p->name,
+                (string) ($entries['births'] ?? ''),
+                (string) ($entries['marriages'] ?? ''),
+                (string) ($entries['deaths'] ?? ''),
+                (string) ($entries['parish_census'] ?? ''),
+            ];
+        }, $parishes);
+    }
+    $widths = array_map('strlen', $header);
+    foreach ($data as $row) {
+        foreach ($row as $i => $cell) {
+            $widths[$i] = max($widths[$i], strlen((string) $cell));
+        }
+    }
+    $line = static function (array $row) use ($widths): string {
+        $parts = [];
+        foreach ($row as $i => $cell) {
+            $parts[] = str_pad((string) $cell, $widths[$i]);
+        }
+        return rtrim(implode('  ', $parts));
+    };
+    $out = $line($header) . PHP_EOL;
+    $out .= $line(array_map(static fn (int $w): string => str_repeat('-', $w), $widths)) . PHP_EOL;
+    foreach ($data as $row) {
+        $out .= $line($row) . PHP_EOL;
+    }
+    return $out;
+}
+
+$command = $argv[1] ?? null;
+if ($command === null || in_array($command, ['help', '--help', '-h'], true)) {
+    usage(0);
+}
+$options = parseOptions(array_slice($argv, 2));
+if (isset($options['help'])) {
+    usage(0);
+}
+
+$discoveryMode = isset($options['list-parishes']);
+$restart = isset($options['restart']);
+$refresh = isset($options['refresh']) || $restart;
+$delayMs = max(0, (int) ($options['delay-ms'] ?? 2000));
+$timeout = max(5, (int) ($options['timeout'] ?? 60));
+$http = new NativeHttpClient(timeoutSeconds: $timeout);
+$rateLimiter = new RateLimiter($delayMs);
+$progress = new ConsoleProgressReporter();
+
+if ($discoveryMode) {
+    $cacheDir = isset($options['output']) && is_string($options['output']) && trim($options['output']) !== ''
+        ? rtrim(trim($options['output']), '/')
+        : 'var/discovery-cache';
+    $checkpoints = new JsonCheckpointStore($cacheDir . '/state/checkpoints.json');
+    $rawStore = new RawResponseStore($cacheDir . '/raw');
+
+    try {
+        if ($command === 'geneteka') {
+            $provider = new GenetekaProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
+            $parishes = isset($options['all-regions'])
+                ? $provider->listAllParishes($refresh)
+                : $provider->listParishes(required($options, 'region'), $refresh);
+        } elseif ($command === 'wolyn') {
+            $provider = new WolynMetrykiProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
+            $parishes = $provider->listParishes($refresh);
+        } else {
+            fwrite(STDERR, "Unknown command: $command\n");
+            usage(2);
+        }
+
+        $format = isset($options['format']) && is_string($options['format']) ? strtolower(trim($options['format'])) : 'table';
+        $rendered = renderParishes($parishes, $format);
+        fwrite(STDOUT, $rendered);
+        if (isset($options['save']) && is_string($options['save']) && trim($options['save']) !== '') {
+            $savePath = trim($options['save']);
+            $dir = dirname($savePath);
+            if ($dir !== '.' && !is_dir($dir)) {
+                mkdir($dir, 0775, true);
+            }
+            file_put_contents($savePath, $rendered);
+        }
+        exit(0);
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[ERROR] ' . $e->getMessage() . PHP_EOL);
+        exit(1);
+    }
+}
+
+$outputDir = rtrim(required($options, 'output'), '/');
+$recordsPath = $outputDir . '/records.jsonl';
+$checkpointPath = $outputDir . '/state/checkpoints.json';
+if ($restart) {
+    @unlink($recordsPath);
+    @unlink($checkpointPath);
+}
+$checkpoints = new JsonCheckpointStore($checkpointPath);
+$rawStore = new RawResponseStore($outputDir . '/raw');
+$writer = new JsonlWriter($recordsPath, append: !$restart, deduplicate: true);
+$startedAt = gmdate(DATE_ATOM);
+
+try {
+    if ($command === 'geneteka') {
+        $region = required($options, 'region');
+        $parishId = required($options, 'parish-id');
+        $parish = isset($options['parish']) && is_string($options['parish']) ? trim($options['parish']) : null;
+        $typesRaw = isset($options['types']) && is_string($options['types']) ? $options['types'] : 'B,S,D';
+        $types = array_values(array_filter(array_map('trim', explode(',', $typesRaw))));
+        $pageSize = max(1, min(500, (int) ($options['page-size'] ?? 50)));
+
+        $provider = new GenetekaProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
+        $stats = $provider->acquire($region, $parishId, $parish, $types, $writer, $pageSize, $restart);
+        $config = compact('region', 'parishId', 'parish', 'types', 'pageSize');
+        $providerName = 'geneteka';
+    } elseif ($command === 'wolyn') {
+        $parish = required($options, 'parish');
+        $from = (int) required($options, 'from');
+        $to = (int) required($options, 'to');
+        if ($from < 1500 || $to > 2100) {
+            fwrite(STDERR, "Refusing suspicious year range $from..$to.\n");
+            exit(2);
+        }
+
+        $provider = new WolynMetrykiProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
+        $stats = $provider->acquire($parish, $from, $to, $writer, $restart);
+        $config = compact('parish', 'from', 'to');
+        $providerName = 'wolyn-metryki';
+    } else {
+        fwrite(STDERR, "Unknown command: $command\n");
+        usage(2);
+    }
+
+    $writer->close();
+    $manifest = [
+        'schema' => 'mytree.index-acquisition-manifest.v1',
+        'provider' => $providerName,
+        'started_at' => $startedAt,
+        'finished_at' => gmdate(DATE_ATOM),
+        'configuration' => $config,
+        'minimum_delay_ms' => $delayMs,
+        'records_file' => 'records.jsonl',
+        'checkpoint_file' => 'state/checkpoints.json',
+        'raw_directory' => 'raw',
+        'stats' => $stats->toArray(),
+        'writer' => [
+            'written_this_run' => $writer->writtenCount(),
+            'duplicates_skipped_this_run' => $writer->duplicateCount(),
+        ],
+    ];
+    writeJson($outputDir . '/manifest.json', $manifest);
+    fwrite(STDOUT, json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL);
+} catch (Throwable $e) {
+    $writer->close();
+    fwrite(STDERR, '[ERROR] ' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}

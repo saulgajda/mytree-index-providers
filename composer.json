@@ -1,0 +1,17 @@
+{
+  "name": "mytree/index-providers",
+  "description": "Standalone acquisition providers for genealogy index services, designed for later MyTree/Laravel integration.",
+  "type": "library",
+  "license": "Apache-2.0",
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "MyTree\\IndexProviders\\": "src/"
+    }
+  },
+  "scripts": {
+    "test": "php tests/run.php"
+  }
+}
