@@ -1,16 +1,38 @@
 {
   "name": "mytree/index-providers",
-  "description": "Standalone acquisition providers for genealogy index services, designed for later MyTree/Laravel integration.",
+  "description": "Standalone PHP providers for acquiring genealogical indexes from Geneteka and Metryki-Wołyń, designed for integration with MyTree and Laravel.",
   "type": "library",
+  "keywords": [
+    "genealogy",
+    "genealogical indexes",
+    "geneteka",
+    "metryki wolyn",
+    "mytree"
+  ],
+  "homepage": "https://github.com/saulgajda/mytree-index-providers",
   "license": "Apache-2.0",
+  "authors": [
+    {
+      "name": "saulgajda",
+      "homepage": "https://github.com/saulgajda",
+      "role": "Developer"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/saulgajda/mytree-index-providers/issues",
+    "source": "https://github.com/saulgajda/mytree-index-providers"
+  },
   "require": {
-    "php": ">=8.2"
+    "php": "^8.2"
   },
   "autoload": {
     "psr-4": {
       "MyTree\\IndexProviders\\": "src/"
     }
   },
+  "bin": [
+    "bin/mytree-index"
+  ],
   "scripts": {
     "test": "php tests/run.php"
   }
