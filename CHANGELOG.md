@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- **Breaking:** Geneteka acquisition API now accepts canonical `RecordType` enum values instead of provider-specific `B`/`S`/`D` strings.
+- Added shared `RecordType` enum (`birth`, `marriage`, `death`, `parish_census`).
+- Geneteka maps canonical record types to its `bdm` codes internally.
+- CLI `--types` now accepts `birth,marriage,death`.
+- Migrated the test suite from the custom `tests/run.php` runner to PHPUnit with separate unit and integration tests.
+
 ## 0.2.0
 
 - Added parish discovery mode for Geneteka and Metryki-Wołyń.
