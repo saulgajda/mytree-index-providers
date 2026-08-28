@@ -235,14 +235,22 @@ Dzięki temu późniejszy importer MyTree może utworzyć `Source`, `SourceLocat
 
 ## Testy
 
+Testy są napisane w PHPUnit. Najpierw zainstaluj zależności developerskie:
+
 ```bash
-php tests/run.php
+composer install
 ```
 
-lub po `composer install`:
+Następnie uruchom cały zestaw:
 
 ```bash
 composer test
+```
+
+Bezpośrednie uruchomienie PHPUnit:
+
+```bash
+vendor/bin/phpunit
 ```
 
 ## Integracja z Laravel/MyTree
