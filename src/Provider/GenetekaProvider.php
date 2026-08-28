@@ -11,6 +11,7 @@ use MyTree\IndexProviders\Contracts\RecordWriterInterface;
 use MyTree\IndexProviders\Domain\AcquisitionStats;
 use MyTree\IndexProviders\Domain\AvailableParish;
 use MyTree\IndexProviders\Domain\ExternalIndexRecord;
+use MyTree\IndexProviders\Domain\RecordType;
 use MyTree\IndexProviders\Domain\ValueRepresentation;
 use MyTree\IndexProviders\Storage\RawResponseStore;
 use MyTree\IndexProviders\Support\HtmlSelectParser;
@@ -162,7 +163,7 @@ final class GenetekaProvider
     private function listParishesFromApiFallback(string $region, ?string $regionName, bool $force): array
     {
         $url = self::ENDPOINT . '?' . http_build_query([
-            'bdm' => 'B', 'w' => $region, 'rid' => 'A', 'length' => 1, 'start' => 0,
+            'bdm' => $this->providerTypeCode(RecordType::Birth), 'w' => $region, 'rid' => 'A', 'length' => 1, 'start' => 0,
         ], '', '&', PHP_QUERY_RFC3986);
         $cacheKey = 'parish-discovery-api_' . $region;
         $body = !$force ? $this->rawStore->get('geneteka', $cacheKey, 'json') : null;
@@ -222,9 +223,7 @@ final class GenetekaProvider
         return $result;
     }
 
-    /**
-     * @param list<string> $types B=birth, S=marriage, D=death
-     */
+    /** @param list<RecordType> $types */
     public function acquire(
         string $region,
         string $parishId,
@@ -234,12 +233,15 @@ final class GenetekaProvider
         int $pageSize = 50,
         bool $force = false,
     ): AcquisitionStats {
+        foreach ($types as $type) {
+            if (!$type instanceof RecordType) {
+                throw new RuntimeException('Geneteka record types must be RecordType enum values.');
+            }
+            $this->providerTypeCode($type);
+        }
+
         $stats = new AcquisitionStats();
         foreach ($types as $type) {
-            $type = strtoupper(trim($type));
-            if (!in_array($type, ['B', 'S', 'D'], true)) {
-                throw new RuntimeException('Unsupported Geneteka type: ' . $type . '. Expected B, S or D.');
-            }
             $this->acquireType($region, $parishId, $parishName, $type, $writer, $pageSize, $force, $stats);
         }
         return $stats;
@@ -249,13 +251,13 @@ final class GenetekaProvider
         string $region,
         string $parishId,
         ?string $parishName,
-        string $type,
+        RecordType $type,
         RecordWriterInterface $writer,
         int $pageSize,
         bool $force,
         AcquisitionStats $stats,
     ): void {
-        $metaKey = "geneteka:$region:$parishId:$type:meta";
+        $metaKey = "geneteka:$region:$parishId:{$type->value}:meta";
         $meta = $force ? null : $this->checkpoints->get($metaKey);
         $total = is_array($meta) && isset($meta['records_total']) ? (int) $meta['records_total'] : null;
         $firstPageConsumed = false;
@@ -268,14 +270,14 @@ final class GenetekaProvider
                 'page_size' => $pageSize,
                 'updated_at' => gmdate(DATE_ATOM),
             ]);
-            $this->progress->info("Geneteka $region/$parishId $type: $total records.");
+            $this->progress->info("Geneteka $region/$parishId {$type->value}: $total records.");
             $this->consumePage($first, $region, $parishId, $parishName, $type, 0, $pageSize, $writer, $stats, $force);
             $firstPageConsumed = true;
         }
 
         $pages = $total === 0 ? 0 : (int) ceil($total / $pageSize);
         for ($page = $firstPageConsumed ? 1 : 0; $page < $pages; $page++) {
-            $checkpointKey = "geneteka:$region:$parishId:$type:page:$page";
+            $checkpointKey = "geneteka:$region:$parishId:{$type->value}:page:$page";
             if (!$force && $this->checkpoints->get($checkpointKey) === true) {
                 $stats->skippedUnits++;
                 continue;
@@ -289,28 +291,29 @@ final class GenetekaProvider
     }
 
     /** @return array<string,mixed> */
-    private function fetchPage(string $region, string $parishId, string $type, int $page, int $pageSize, AcquisitionStats $stats, bool $useCache): array
+    private function fetchPage(string $region, string $parishId, RecordType $type, int $page, int $pageSize, AcquisitionStats $stats, bool $useCache): array
     {
+        $providerType = $this->providerTypeCode($type);
         $start = $page * $pageSize;
         $url = self::ENDPOINT . '?' . http_build_query([
-            'bdm' => $type,
+            'bdm' => $providerType,
             'w' => $region,
             'rid' => $parishId,
             'length' => $pageSize,
             'start' => $start,
         ], '', '&', PHP_QUERY_RFC3986);
 
-        $cacheKey = "{$region}_{$parishId}_{$type}_{$start}";
+        $cacheKey = "{$region}_{$parishId}_{$providerType}_{$start}";
         $cachedBody = $useCache ? $this->rawStore->get('geneteka', $cacheKey, 'json') : null;
         $cacheMeta = $useCache ? $this->rawStore->metadata('geneteka', $cacheKey, 'json') : null;
         if ($cachedBody !== null) {
-            $this->progress->info("Geneteka $region/$parishId $type: using cached page start=$start.");
+            $this->progress->info("Geneteka $region/$parishId {$type->value}: using cached page start=$start.");
             $body = $cachedBody;
             $retrievedAt = is_array($cacheMeta) && isset($cacheMeta['retrieved_at']) ? (string) $cacheMeta['retrieved_at'] : gmdate(DATE_ATOM);
             $rawPath = $this->rawStore->path('geneteka', $cacheKey, 'json');
             $rawSha256 = hash('sha256', $body);
         } else {
-            $this->progress->info("Geneteka $region/$parishId $type: page " . ($page + 1) . " (start=$start).");
+            $this->progress->info("Geneteka $region/$parishId {$type->value}: page " . ($page + 1) . " (start=$start).");
             $this->rateLimiter->beforeRequest();
             $response = $this->http->get($url, [
                 'Referer' => 'https://geneteka.genealodzy.pl/index.php',
@@ -331,7 +334,7 @@ final class GenetekaProvider
                 'retrieved_at' => $retrievedAt,
                 'region' => $region,
                 'parish_id' => $parishId,
-                'record_type' => $type,
+                'record_type' => $type->value,
                 'start' => $start,
                 'length' => $pageSize,
             ]);
@@ -354,14 +357,14 @@ final class GenetekaProvider
         string $region,
         string $parishId,
         ?string $parishName,
-        string $type,
+        RecordType $type,
         int $page,
         int $pageSize,
         RecordWriterInterface $writer,
         AcquisitionStats $stats,
         bool $force,
     ): void {
-        $checkpointKey = "geneteka:$region:$parishId:$type:page:$page";
+        $checkpointKey = "geneteka:$region:$parishId:{$type->value}:page:$page";
         if (!$force && $this->checkpoints->get($checkpointKey) === true) {
             return;
         }
@@ -383,7 +386,7 @@ final class GenetekaProvider
                 (string) ($json['_mytree_raw_sha256'] ?? ''),
                 (string) ($json['_mytree_retrieved_at'] ?? gmdate(DATE_ATOM)),
             ));
-            $stats->record($this->canonicalType($type));
+            $stats->record($type->value);
         }
 
         $this->checkpoints->set($checkpointKey, true);
@@ -395,7 +398,7 @@ final class GenetekaProvider
         string $region,
         string $parishId,
         ?string $parishName,
-        string $type,
+        RecordType $type,
         int $page,
         int $rowIndex,
         string $requestUrl,
@@ -403,6 +406,7 @@ final class GenetekaProvider
         string $rawSha256,
         string $retrievedAt,
     ): ExternalIndexRecord {
+        $providerType = $this->providerTypeCode($type);
         $values = array_map(static fn (mixed $v): string => trim((string) $v), array_values($row));
         if (count($values) < 10) {
             throw new RuntimeException('Geneteka row has fewer than 10 columns.');
@@ -410,9 +414,9 @@ final class GenetekaProvider
         $metadata = $this->metadataParser->parse($values[9]);
         $providerRecordId = isset($metadata['gid']) && $metadata['gid'] !== ''
             ? (string) $metadata['gid']
-            : hash('sha256', 'geneteka|' . $region . '|' . $parishId . '|' . $type . '|page:' . $page . '|row:' . $rowIndex . '|' . json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            : hash('sha256', 'geneteka|' . $region . '|' . $parishId . '|' . $providerType . '|page:' . $page . '|row:' . $rowIndex . '|' . json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
 
-        if ($type === 'S') {
+        if ($type === RecordType::Marriage) {
             $fields = [
                 'year_raw' => $values[0],
                 'record_number_raw' => $values[1],
@@ -447,7 +451,7 @@ final class GenetekaProvider
         }
 
         $year = preg_match('~^\d{4}$~', $values[0]) ? (int) $values[0] : null;
-        $parish = $type === 'S' ? ($values[8] !== '' ? $values[8] : $parishName) : ($values[7] !== '' ? $values[7] : $parishName);
+        $parish = $type === RecordType::Marriage ? ($values[8] !== '' ? $values[8] : $parishName) : ($values[7] !== '' ? $values[7] : $parishName);
         if ($parishName !== null && $parish !== null && strcasecmp(trim($parish), trim($parishName)) !== 0) {
             $warningKey = strtolower(trim($parishName)) . '|' . strtolower(trim($parish));
             if (!isset($this->warnedParishMismatches[$warningKey])) {
@@ -459,12 +463,12 @@ final class GenetekaProvider
         return new ExternalIndexRecord(
             provider: 'geneteka',
             providerRecordId: $providerRecordId,
-            recordType: $this->canonicalType($type),
+            recordType: $type->value,
             parish: $parish,
             year: $year,
             fields: $fields,
             raw: [
-                'record_type_code' => $type,
+                'record_type_code' => $providerType,
                 'columns' => $values,
             ],
             provenance: [
@@ -494,13 +498,13 @@ final class GenetekaProvider
         return trim(html_entity_decode($beforeTag, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     }
 
-    private function canonicalType(string $type): string
+    private function providerTypeCode(RecordType $type): string
     {
         return match ($type) {
-            'B' => 'birth',
-            'S' => 'marriage',
-            'D' => 'death',
-            default => 'other',
+            RecordType::Birth => 'B',
+            RecordType::Marriage => 'S',
+            RecordType::Death => 'D',
+            default => throw new RuntimeException('Unsupported Geneteka record type: ' . $type->value),
         };
     }
 }

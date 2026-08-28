@@ -25,15 +25,16 @@ php bin/mytree-index geneteka \
   --region=06mp \
   --parish-id=4812 \
   --parish=Imbramowice \
-  --types=B,S,D \
+  --types=birth,marriage,death \
   --output=var/imbramowice
 ```
 
-Typy:
+Typy wejściowe są kanonicznymi typami MyTree, niezależnymi od oznaczeń konkretnego portalu:
 
-- `B` — urodzenia,
-- `S` — śluby,
-- `D` — zgony.
+- `birth` — urodzenia,
+- `marriage` — śluby,
+- `death` — zgony.
+
 
 ### Metryki-Wołyń — Szumsk
 

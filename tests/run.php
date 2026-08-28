@@ -6,6 +6,7 @@ require dirname(__DIR__) . '/bootstrap.php';
 
 use MyTree\IndexProviders\Contracts\HttpClientInterface;
 use MyTree\IndexProviders\Domain\HttpResponse;
+use MyTree\IndexProviders\Domain\RecordType;
 use MyTree\IndexProviders\Provider\GenetekaMetadataParser;
 use MyTree\IndexProviders\Provider\GenetekaProvider;
 use MyTree\IndexProviders\Provider\WolynMetrykiProvider;
@@ -21,12 +22,16 @@ final class FakeHttpClient implements HttpClientInterface
 {
     public int $calls = 0;
 
+    /** @var list<string> */
+    public array $urls = [];
+
     /** @param callable(string):HttpResponse $responder */
     public function __construct(private $responder) {}
 
     public function get(string $url, array $headers = []): HttpResponse
     {
         $this->calls++;
+        $this->urls[] = $url;
         return ($this->responder)($url);
     }
 }
@@ -130,6 +135,30 @@ ok(($birth['representation']['verbatim_from_provider'] ?? null) === true, 'Woły
 ok(($birth['representation']['producer']['indexer_id'] ?? null) === 'DM', 'Wołyń representation keeps indexer identity.');
 ok(($birth['representation']['original_document_wording_asserted'] ?? null) === false, 'Wołyń does not assert original-document wording.');
 
+// Geneteka canonical record types are mapped to provider-specific bdm codes internally.
+$mappingBody = json_encode(['recordsTotal' => '0', 'recordsFiltered' => '0', 'data' => []], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+$mappingHttp = new FakeHttpClient(fn (string $url): HttpResponse => new HttpResponse(200, [], (string) $mappingBody, $url));
+$mappingDir = $tmp . '/gen-type-mapping';
+$mappingWriter = new JsonlWriter($mappingDir . '/records.jsonl', false);
+$mappingProvider = new GenetekaProvider(
+    $mappingHttp,
+    new JsonCheckpointStore($mappingDir . '/state.json'),
+    new RawResponseStore($mappingDir . '/raw'),
+    new RateLimiter(0),
+);
+$mappingProvider->acquire(
+    '06mp',
+    '4812',
+    'Imbramowice',
+    [RecordType::Birth, RecordType::Marriage, RecordType::Death],
+    $mappingWriter,
+);
+$mappingWriter->close();
+ok(count($mappingHttp->urls) === 3, 'Geneteka performs one initial request for each requested canonical record type.');
+ok(str_contains($mappingHttp->urls[0] ?? '', 'bdm=B'), 'Geneteka maps birth to bdm=B.');
+ok(str_contains($mappingHttp->urls[1] ?? '', 'bdm=S'), 'Geneteka maps marriage to bdm=S.');
+ok(str_contains($mappingHttp->urls[2] ?? '', 'bdm=D'), 'Geneteka maps death to bdm=D.');
+
 // Geneteka provider end-to-end with one page.
 $genetekaRow = [
     '1913', '', 'Anna ', 'Tiliszczak', 'Michał', 'Melania', 'Dzjurbjel', 'Imbramowice', 'Imbramowice', $stuff,
@@ -144,10 +173,11 @@ $gen = new GenetekaProvider(
     new RawResponseStore($genDir . '/raw'),
     new RateLimiter(0),
 );
-$genStats = $gen->acquire('06mp', '4812', 'Imbramowice', ['B'], $genWriter);
+$genStats = $gen->acquire('06mp', '4812', 'Imbramowice', [RecordType::Birth], $genWriter);
 $genWriter->close();
 ok($genStats->records === 1, 'Geneteka provider maps one birth record.');
 ok($genHttp->calls === 1, 'Geneteka single-page acquisition performs one HTTP request.');
+ok(str_contains($genHttp->urls[0] ?? '', 'bdm=B'), 'Geneteka maps canonical birth type to provider code B.');
 $genLine = json_decode((string) file_get_contents($genDir . '/records.jsonl'), true);
 ok(($genLine['provider_record_id'] ?? null) === '12309516', 'Geneteka uses gid as provider_record_id when available.');
 ok(($genLine['fields']['person']['mother_surname_raw'] ?? null) === 'Dzjurbjel', 'Geneteka person mapping keeps mother surname.');
@@ -163,7 +193,7 @@ $gen2 = new GenetekaProvider(
     new RawResponseStore($genDir . '/raw'),
     new RateLimiter(0),
 );
-$gen2->acquire('06mp', '4812', 'Imbramowice', ['B'], $genWriter2);
+$gen2->acquire('06mp', '4812', 'Imbramowice', [RecordType::Birth], $genWriter2);
 $genWriter2->close();
 ok($genHttp->calls === 1, 'Geneteka resume uses checkpoint and makes no extra request.');
 

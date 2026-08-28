@@ -6,6 +6,7 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/bootstrap.php';
 
 use MyTree\IndexProviders\Domain\AvailableParish;
+use MyTree\IndexProviders\Domain\RecordType;
 use MyTree\IndexProviders\Http\NativeHttpClient;
 use MyTree\IndexProviders\Provider\GenetekaProvider;
 use MyTree\IndexProviders\Provider\WolynMetrykiProvider;
@@ -23,7 +24,7 @@ MyTree Index Providers — standalone CLI
 Download indexes — Geneteka:
   php bin/mytree-index geneteka \
     --region=06mp --parish-id=4812 --parish=Imbramowice \
-    --types=B,S,D --output=var/imbramowice
+    --types=birth,marriage,death --output=var/imbramowice
 
 Download indexes — Metryki-Wołyń:
   php bin/mytree-index wolyn \
@@ -57,7 +58,7 @@ Geneteka acquisition options:
   --region=...      Region code, e.g. 06mp
   --parish-id=...   Geneteka rid, e.g. 4812
   --parish=...      Human-readable parish name (stored as requested metadata)
-  --types=B,S,D     Comma-separated record types
+  --types=...       Comma-separated record types: birth, marriage, death
   --page-size=50    Page size (default 50)
 
 Metryki-Wołyń acquisition options:
@@ -240,13 +241,32 @@ try {
         $region = required($options, 'region');
         $parishId = required($options, 'parish-id');
         $parish = isset($options['parish']) && is_string($options['parish']) ? trim($options['parish']) : null;
-        $typesRaw = isset($options['types']) && is_string($options['types']) ? $options['types'] : 'B,S,D';
-        $types = array_values(array_filter(array_map('trim', explode(',', $typesRaw))));
+        $typesRaw = isset($options['types']) && is_string($options['types']) ? $options['types'] : 'birth,marriage,death';
+        $typeValues = array_values(array_filter(array_map(
+            static fn (string $value): string => strtolower(trim($value)),
+            explode(',', $typesRaw),
+        )));
+        $types = [];
+        foreach ($typeValues as $value) {
+            $type = RecordType::tryFrom($value);
+            if ($type === null || $type === RecordType::ParishCensus) {
+                throw new InvalidArgumentException(
+                    "Unsupported Geneteka record type '$value'. Use birth, marriage or death."
+                );
+            }
+            $types[] = $type;
+        }
         $pageSize = max(1, min(500, (int) ($options['page-size'] ?? 50)));
 
         $provider = new GenetekaProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
         $stats = $provider->acquire($region, $parishId, $parish, $types, $writer, $pageSize, $restart);
-        $config = compact('region', 'parishId', 'parish', 'types', 'pageSize');
+        $config = [
+            'region' => $region,
+            'parishId' => $parishId,
+            'parish' => $parish,
+            'types' => array_map(static fn (RecordType $type): string => $type->value, $types),
+            'pageSize' => $pageSize,
+        ];
         $providerName = 'geneteka';
     } elseif ($command === 'wolyn') {
         $parish = required($options, 'parish');
