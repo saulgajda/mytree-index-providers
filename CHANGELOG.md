@@ -2,10 +2,14 @@
 
 ## 0.5.0
 
-- **Breaking:** Geneteka acquisition API now accepts canonical `RecordType` enum values instead of provider-specific `B`/`S`/`D` strings.
+- **Breaking:** replaced Geneteka's multi-argument `acquire(...)` API with immutable fluent `acquisition()` builder representing one provider-form query and one `RecordType`.
+- Geneteka fluent query supports date ranges, primary/secondary person filters, exact matching, excluding parent fields, and provider-specific `formParameter(...)` escape hatch.
+- Geneteka cache/checkpoint keys now use a deterministic fingerprint of the complete query configuration.
+- Pagination prefers `recordsFiltered` when provider-side filters are active.
+- Added Geneteka availability discovery with record-type-specific `rid` values and non-continuous `YearRange` coverage.
+- Added `--availability` CLI diagnostics and switched Geneteka CLI acquisition to singular `--type` plus optional search filters.
 - Added shared `RecordType` enum (`birth`, `marriage`, `death`, `parish_census`).
 - Geneteka maps canonical record types to its `bdm` codes internally.
-- CLI `--types` now accepts `birth,marriage,death`.
 - Migrated the test suite from the custom `tests/run.php` runner to PHPUnit with separate unit and integration tests.
 
 ## 0.2.0

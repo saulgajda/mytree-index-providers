@@ -25,16 +25,64 @@ php bin/mytree-index geneteka \
   --region=06mp \
   --parish-id=4812 \
   --parish=Imbramowice \
-  --types=birth,marriage,death \
+  --type=birth \
+  --from=1853 \
+  --to=1860 \
   --output=var/imbramowice
 ```
 
-Typy wejściowe są kanonicznymi typami MyTree, niezależnymi od oznaczeń konkretnego portalu:
+Typ wejściowy jest kanonicznym `RecordType` MyTree, niezależnym od oznaczeń konkretnego portalu:
 
 - `birth` — urodzenia,
 - `marriage` — śluby,
 - `death` — zgony.
 
+Jedna operacja Geneteki odpowiada jednemu stanowi formularza i jednemu typowi rekordu. Agregowanie kilku typów, dzielenie pracy na przedziały i planowanie kolejnych zapytań pozostaje odpowiedzialnością warstwy wyższej.
+
+### Fluent API Geneteki
+
+Provider nie przyjmuje już rosnącej listy argumentów w `acquire(...)`. Każde zapytanie buduje się jako niemutowalną konfigurację:
+
+```php
+$stats = $provider
+    ->acquisition()
+    ->region('06mp')
+    ->parish('4812', 'Imbramowice')
+    ->recordType(RecordType::Birth)
+    ->person('Gajda', 'Józef')
+    ->years(1853, 1860)
+    ->exact()
+    ->acquire($writer);
+```
+
+Zweryfikowane pola formularza mają wygodne metody (`person`, `secondPerson`, `years`, `exact`, `excludeParents`). Dla pól specyficznych dla Geneteki, które nie mają jeszcze dedykowanej metody, można użyć kontrolowanego escape hatch:
+
+```php
+$query = $query->formParameter('nazwa_pola_geneteki', 'wartość');
+```
+
+Parametry transportowe `bdm`, `w`, `rid`, `length` i `start` są zastrzeżone i nie mogą zostać nadpisane przez `formParameter()`.
+
+### Dostępność lat i identyfikatory per typ
+
+Interfejs Geneteki publikuje dla wybranej parafii zakresy lat, które mogą być nieciągłe, a linki Urodzenia/Małżeństwa/Zgony mogą prowadzić do różnych wartości `rid`. Provider udostępnia te informacje osobno od samej akwizycji:
+
+```php
+$availability = $provider->discoverAvailability(
+    region: '10pl',
+    anchorType: RecordType::Birth,
+    anchorParishId: '4257',
+);
+```
+
+Każdy `GenetekaRecordAvailability` zawiera `recordType`, właściwy dla niego `providerParishId` oraz listę `YearRange[]`. Biblioteka nie wykorzystuje tych zakresów do automatycznego planowania pobierania — może to zrobić późniejszy Acquisition Manager / warstwa Laravelowa.
+
+CLI diagnostyczne:
+
+```bash
+php bin/mytree-index geneteka --availability \
+  --region=10pl --parish-id=4257 --type=birth --format=json
+```
 
 ### Metryki-Wołyń — Szumsk
 
@@ -159,6 +207,8 @@ Program zapisuje checkpoint po każdej kompletnej jednostce pracy:
 
 Ponowne uruchomienie tego samego polecenia z tym samym `--output` wznowi pracę.
 
+Dla Geneteki cache i checkpointy są rozdzielane według deterministycznego fingerprintu całej konfiguracji zapytania (region, `rid`, typ rekordu, parametry formularza i rozmiar strony). Dzięki temu dwa różne filtry nie mogą przypadkowo współdzielić wyniku cache.
+
 Surowe odpowiedzi są zapisywane w `raw/`. Jeżeli odpowiedź została pobrana, ale proces przerwał się przed checkpointem, przy wznowieniu program użyje lokalnego cache zamiast ponownie pytać serwis.
 
 `records.jsonl` deduplikuje rekordy po `provider_record_id`, dzięki czemu przerwanie w środku jednostki nie powinno tworzyć duplikatów po wznowieniu.
@@ -186,8 +236,8 @@ var/imbramowice/
 │   └── checkpoints.json
 └── raw/
     └── geneteka/
-        ├── 06mp_4812_B_0.json
-        ├── 06mp_4812_B_0.json.meta.json
+        ├── query_<fingerprint>_0.json
+        ├── query_<fingerprint>_0.json.meta.json
         └── ...
 ```
 

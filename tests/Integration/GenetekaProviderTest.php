@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace MyTree\IndexProviders\Tests\Integration;
 
+use InvalidArgumentException;
 use MyTree\IndexProviders\Domain\HttpResponse;
 use MyTree\IndexProviders\Domain\RecordType;
 use MyTree\IndexProviders\Provider\GenetekaProvider;
@@ -16,30 +17,92 @@ use MyTree\IndexProviders\Writer\JsonlWriter;
 
 final class GenetekaProviderTest extends TestCase
 {
-    public function testMapsCanonicalRecordTypesToProviderSpecificBdmCodes(): void
+    public function testFluentAcquisitionMapsCanonicalTypesAndFormFields(): void
+    {
+        $body = json_encode(
+            ['recordsTotal' => '120', 'recordsFiltered' => '0', 'data' => []],
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR,
+        );
+        $http = new FakeHttpClient(fn (string $url): HttpResponse => new HttpResponse(200, [], $body, $url));
+        $dir = $this->tmp . '/gen-query';
+        $writer = new JsonlWriter($dir . '/records.jsonl', false);
+        $provider = $this->provider($http, $dir);
+
+        $provider
+            ->acquisition()
+            ->region('06mp')
+            ->parish('4812', 'Imbramowice')
+            ->recordType(RecordType::Birth)
+            ->person('Gajda', 'Józef')
+            ->secondPerson('Nowak', 'Anna')
+            ->years(1853, 1860)
+            ->exact()
+            ->excludeParents()
+            ->formParameter('custom_future_field', 'x')
+            ->acquire($writer);
+        $writer->close();
+
+        self::assertSame(1, $http->calls, 'recordsFiltered=0 must stop pagination after the first request.');
+        $query = $this->query($http->urls[0]);
+        self::assertSame('B', $query['bdm'] ?? null);
+        self::assertSame('06mp', $query['w'] ?? null);
+        self::assertSame('4812', $query['rid'] ?? null);
+        self::assertSame('Gajda', $query['search_lastname'] ?? null);
+        self::assertSame('Józef', $query['search_name'] ?? null);
+        self::assertSame('Nowak', $query['search_lastname2'] ?? null);
+        self::assertSame('Anna', $query['search_name2'] ?? null);
+        self::assertSame('1853', $query['from_date'] ?? null);
+        self::assertSame('1860', $query['to_date'] ?? null);
+        self::assertSame('1', $query['exac'] ?? null);
+        self::assertSame('1', $query['parents'] ?? null);
+        self::assertSame('x', $query['custom_future_field'] ?? null);
+    }
+
+    public function testFluentBuilderDoesNotMutateBaseQuery(): void
+    {
+        $provider = $this->provider(new FakeHttpClient(
+            fn (string $url): HttpResponse => new HttpResponse(200, [], '{}', $url),
+        ), $this->tmp . '/immutable');
+
+        $base = $provider
+            ->acquisition()
+            ->region('06mp')
+            ->parish('4812')
+            ->recordType(RecordType::Birth);
+        $filtered = $base->years(1853, 1860)->person('Gajda', 'Józef');
+
+        self::assertSame([], $base->configuration()['form_parameters']);
+        self::assertSame([
+            'from_date' => 1853,
+            'search_lastname' => 'Gajda',
+            'search_name' => 'Józef',
+            'to_date' => 1860,
+        ], $filtered->configuration()['form_parameters']);
+    }
+
+    public function testDifferentQueriesUseIndependentCacheAndCheckpointFingerprints(): void
     {
         $body = json_encode(
             ['recordsTotal' => '0', 'recordsFiltered' => '0', 'data' => []],
             JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR,
         );
         $http = new FakeHttpClient(fn (string $url): HttpResponse => new HttpResponse(200, [], $body, $url));
-        $dir = $this->tmp . '/gen-type-mapping';
-        $writer = new JsonlWriter($dir . '/records.jsonl', false);
+        $dir = $this->tmp . '/gen-cache';
         $provider = $this->provider($http, $dir);
 
-        $provider->acquire(
-            '06mp',
-            '4812',
-            'Imbramowice',
-            [RecordType::Birth, RecordType::Marriage, RecordType::Death],
-            $writer,
-        );
-        $writer->close();
+        foreach ([1853, 1853, 1854] as $i => $year) {
+            $writer = new JsonlWriter($dir . "/records-$i.jsonl", false);
+            $provider
+                ->acquisition()
+                ->region('06mp')
+                ->parish('4812')
+                ->recordType(RecordType::Birth)
+                ->years($year, $year)
+                ->acquire($writer);
+            $writer->close();
+        }
 
-        self::assertCount(3, $http->urls);
-        self::assertStringContainsString('bdm=B', $http->urls[0]);
-        self::assertStringContainsString('bdm=S', $http->urls[1]);
-        self::assertStringContainsString('bdm=D', $http->urls[2]);
+        self::assertSame(2, $http->calls, 'Same query should resume; a different year range must use a different fingerprint.');
     }
 
     public function testMapsBirthRecordAndResumesFromCheckpoint(): void
@@ -52,8 +115,13 @@ final class GenetekaProviderTest extends TestCase
         $dir = $this->tmp . '/gen';
         $writer = new JsonlWriter($dir . '/records.jsonl', false);
         $provider = $this->provider($http, $dir);
+        $query = $provider
+            ->acquisition()
+            ->region('06mp')
+            ->parish('4812', 'Imbramowice')
+            ->recordType(RecordType::Birth);
 
-        $stats = $provider->acquire('06mp', '4812', 'Imbramowice', [RecordType::Birth], $writer);
+        $stats = $query->acquire($writer);
         $writer->close();
 
         self::assertSame(1, $stats->records);
@@ -66,13 +134,53 @@ final class GenetekaProviderTest extends TestCase
         self::assertSame('indexer_rendering', $record['representation']['kind'] ?? null);
         self::assertSame('karpecki.lukasz', $record['representation']['producer']['indexer_id'] ?? null);
         self::assertFalse($record['representation']['original_document_wording_asserted'] ?? true);
+        self::assertNotEmpty($record['provenance']['query_fingerprint'] ?? null);
 
         $resumeWriter = new JsonlWriter($dir . '/records.jsonl', true);
-        $resumeProvider = $this->provider($http, $dir);
-        $resumeProvider->acquire('06mp', '4812', 'Imbramowice', [RecordType::Birth], $resumeWriter);
+        $query->acquire($resumeWriter);
         $resumeWriter->close();
 
         self::assertSame(1, $http->calls, 'Resume should use checkpoint and make no extra request.');
+    }
+
+    public function testReservedTransportParametersCannotBeOverridden(): void
+    {
+        $provider = $this->provider(new FakeHttpClient(
+            fn (string $url): HttpResponse => new HttpResponse(200, [], '{}', $url),
+        ), $this->tmp . '/reserved');
+
+        $this->expectException(InvalidArgumentException::class);
+        $provider->acquisition()->formParameter('rid', 'other');
+    }
+
+    public function testDiscoversRecordSpecificIdsAndNonContinuousYearRanges(): void
+    {
+        $pages = [
+            'B' => $this->availabilityHtml('B', '4257', ['1645', '1654', '1656', '1658-1862', '1868-1907']),
+            'S' => $this->availabilityHtml('S', '10552', ['1701-1750']),
+            'D' => $this->availabilityHtml('D', '8629', ['1800', '1802-1810']),
+        ];
+        $http = new FakeHttpClient(function (string $url) use ($pages): HttpResponse {
+            $query = $this->query($url);
+            $type = (string) ($query['bdm'] ?? '');
+            return new HttpResponse(200, [], $pages[$type] ?? '', $url);
+        });
+        $provider = $this->provider($http, $this->tmp . '/availability');
+
+        $availability = $provider->discoverAvailability('10pl', RecordType::Birth, '4257');
+
+        self::assertCount(3, $availability);
+        self::assertSame(3, $http->calls);
+        self::assertSame('4257', $availability[0]->providerParishId);
+        self::assertSame('10552', $availability[1]->providerParishId);
+        self::assertSame('8629', $availability[2]->providerParishId);
+        self::assertSame([[1645, 1645], [1654, 1654], [1656, 1656], [1658, 1862], [1868, 1907]], array_map(
+            static fn ($range): array => [$range->from, $range->to],
+            $availability[0]->yearRanges,
+        ));
+
+        $provider->discoverAvailability('10pl', RecordType::Birth, '4257');
+        self::assertSame(3, $http->calls, 'Availability pages should be reused from raw cache.');
     }
 
     private function provider(FakeHttpClient $http, string $dir): GenetekaProvider
@@ -83,6 +191,26 @@ final class GenetekaProviderTest extends TestCase
             new RawResponseStore($dir . '/raw'),
             new RateLimiter(0),
         );
+    }
+
+    /** @return array<string,string> */
+    private function query(string $url): array
+    {
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+        return array_map(static fn (mixed $value): string => (string) $value, $query);
+    }
+
+    /** @param list<string> $ranges */
+    private function availabilityHtml(string $activeType, string $activeRid, array $ranges): string
+    {
+        return '<html><body><a href="help">Jak indeksować</a><div class="years">'
+            . implode('<br>', $ranges)
+            . '</div>'
+            . '<a href="?op=gt&amp;bdm=B&amp;w=10pl&amp;rid=4257">Urodzenia</a>'
+            . '<a href="?op=gt&amp;bdm=S&amp;w=10pl&amp;rid=10552">Małżeństwa</a>'
+            . '<a href="?op=gt&amp;bdm=D&amp;w=10pl&amp;rid=8629">Zgony</a>'
+            . '<span data-active="' . $activeType . '" data-rid="' . $activeRid . '"></span>'
+            . '</body></html>';
     }
 
     /** @return list<string> */

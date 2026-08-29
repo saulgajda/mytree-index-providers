@@ -24,7 +24,7 @@ MyTree Index Providers — standalone CLI
 Download indexes — Geneteka:
   php bin/mytree-index geneteka \
     --region=06mp --parish-id=4812 --parish=Imbramowice \
-    --types=birth,marriage,death --output=var/imbramowice
+    --type=birth --from=1853 --to=1860 --output=var/imbramowice
 
 Download indexes — Metryki-Wołyń:
   php bin/mytree-index wolyn \
@@ -36,6 +36,10 @@ Discover available parishes — Geneteka, one region:
 
 Discover available parishes — Geneteka, all regions:
   php bin/mytree-index geneteka --list-parishes --all-regions
+
+Discover Geneteka record ids and year coverage for one parish:
+  php bin/mytree-index geneteka --availability \
+    --region=10pl --parish-id=4257 --type=birth --format=json
 
 Discover available parishes — Metryki-Wołyń:
   php bin/mytree-index wolyn --list-parishes
@@ -58,8 +62,17 @@ Geneteka acquisition options:
   --region=...      Region code, e.g. 06mp
   --parish-id=...   Geneteka rid, e.g. 4812
   --parish=...      Human-readable parish name (stored as requested metadata)
-  --types=...       Comma-separated record types: birth, marriage, death
+  --type=...        One record type: birth, marriage or death
+  --from=YYYY       Optional first year
+  --to=YYYY         Optional last year
+  --surname=...     Primary surname filter
+  --name=...        Primary given-name filter
+  --surname2=...    Second surname filter
+  --name2=...       Second given-name filter
+  --exact           Exact surname matching (`exac=1`)
+  --exclude-parents Do not search parent fields (`parents=1`)
   --page-size=50    Page size (default 50)
+  --availability    Discover type-specific rid values and non-continuous year ranges
 
 Metryki-Wołyń acquisition options:
   --parish=...      Parish name, e.g. Szumsk
@@ -167,6 +180,40 @@ function renderParishes(array $parishes, string $format): string
     return $out;
 }
 
+
+/** @param list<\MyTree\IndexProviders\Provider\GenetekaRecordAvailability> $items */
+function renderAvailability(array $items, string $format): string
+{
+    $rows = array_map(static fn ($item): array => $item->jsonSerialize(), $items);
+    if ($format === 'json') {
+        return json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL;
+    }
+    if ($format === 'jsonl') {
+        return implode('', array_map(
+            static fn (array $row): string => json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . PHP_EOL,
+            $rows,
+        ));
+    }
+    if ($format !== 'table') {
+        throw new InvalidArgumentException('Unsupported --format. Use table, json or jsonl.');
+    }
+
+    $out = "TYPE      RID    YEAR RANGES" . PHP_EOL;
+    $out .= "--------- ------ ----------------------------------------" . PHP_EOL;
+    foreach ($items as $item) {
+        $ranges = implode(' ', array_map(
+            static fn ($range): string => $range->from === $range->to
+                ? (string) $range->from
+                : $range->from . '-' . $range->to,
+            $item->yearRanges,
+        ));
+        $out .= str_pad($item->recordType->value, 10)
+            . str_pad($item->providerParishId, 7)
+            . $ranges . PHP_EOL;
+    }
+    return $out;
+}
+
 $command = $argv[1] ?? null;
 if ($command === null || in_array($command, ['help', '--help', '-h'], true)) {
     usage(0);
@@ -224,6 +271,39 @@ if ($discoveryMode) {
     }
 }
 
+
+if ($command === 'geneteka' && isset($options['availability'])) {
+    $cacheDir = isset($options['output']) && is_string($options['output']) && trim($options['output']) !== ''
+        ? rtrim(trim($options['output']), '/')
+        : 'var/discovery-cache';
+    $provider = new GenetekaProvider(
+        $http,
+        new JsonCheckpointStore($cacheDir . '/state/checkpoints.json'),
+        new RawResponseStore($cacheDir . '/raw'),
+        $rateLimiter,
+        progress: $progress,
+    );
+    try {
+        $typeValue = strtolower(required($options, 'type'));
+        $type = RecordType::tryFrom($typeValue);
+        if ($type === null || $type === RecordType::ParishCensus) {
+            throw new InvalidArgumentException("Unsupported Geneteka record type '$typeValue'. Use birth, marriage or death.");
+        }
+        $items = $provider->discoverAvailability(
+            required($options, 'region'),
+            $type,
+            required($options, 'parish-id'),
+            $refresh,
+        );
+        $format = isset($options['format']) && is_string($options['format']) ? strtolower(trim($options['format'])) : 'table';
+        fwrite(STDOUT, renderAvailability($items, $format));
+        exit(0);
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[ERROR] ' . $e->getMessage() . PHP_EOL);
+        exit(1);
+    }
+}
+
 $outputDir = rtrim(required($options, 'output'), '/');
 $recordsPath = $outputDir . '/records.jsonl';
 $checkpointPath = $outputDir . '/state/checkpoints.json';
@@ -241,32 +321,45 @@ try {
         $region = required($options, 'region');
         $parishId = required($options, 'parish-id');
         $parish = isset($options['parish']) && is_string($options['parish']) ? trim($options['parish']) : null;
-        $typesRaw = isset($options['types']) && is_string($options['types']) ? $options['types'] : 'birth,marriage,death';
-        $typeValues = array_values(array_filter(array_map(
-            static fn (string $value): string => strtolower(trim($value)),
-            explode(',', $typesRaw),
-        )));
-        $types = [];
-        foreach ($typeValues as $value) {
-            $type = RecordType::tryFrom($value);
-            if ($type === null || $type === RecordType::ParishCensus) {
-                throw new InvalidArgumentException(
-                    "Unsupported Geneteka record type '$value'. Use birth, marriage or death."
-                );
-            }
-            $types[] = $type;
+        $typeValue = isset($options['type']) && is_string($options['type']) ? strtolower(trim($options['type'])) : 'birth';
+        $type = RecordType::tryFrom($typeValue);
+        if ($type === null || $type === RecordType::ParishCensus) {
+            throw new InvalidArgumentException("Unsupported Geneteka record type '$typeValue'. Use birth, marriage or death.");
         }
         $pageSize = max(1, min(500, (int) ($options['page-size'] ?? 50)));
 
         $provider = new GenetekaProvider($http, $checkpoints, $rawStore, $rateLimiter, progress: $progress);
-        $stats = $provider->acquire($region, $parishId, $parish, $types, $writer, $pageSize, $restart);
-        $config = [
-            'region' => $region,
-            'parishId' => $parishId,
-            'parish' => $parish,
-            'types' => array_map(static fn (RecordType $type): string => $type->value, $types),
-            'pageSize' => $pageSize,
-        ];
+        $acquisition = $provider
+            ->acquisition()
+            ->region($region)
+            ->parish($parishId, $parish)
+            ->recordType($type)
+            ->pageSize($pageSize)
+            ->force($restart);
+
+        if (isset($options['from']) && is_string($options['from'])) {
+            $acquisition = $acquisition->fromYear((int) $options['from']);
+        }
+        if (isset($options['to']) && is_string($options['to'])) {
+            $acquisition = $acquisition->toYear((int) $options['to']);
+        }
+        $acquisition = $acquisition->person(
+            isset($options['surname']) && is_string($options['surname']) ? $options['surname'] : null,
+            isset($options['name']) && is_string($options['name']) ? $options['name'] : null,
+        );
+        $acquisition = $acquisition->secondPerson(
+            isset($options['surname2']) && is_string($options['surname2']) ? $options['surname2'] : null,
+            isset($options['name2']) && is_string($options['name2']) ? $options['name2'] : null,
+        );
+        if (isset($options['exact'])) {
+            $acquisition = $acquisition->exact();
+        }
+        if (isset($options['exclude-parents'])) {
+            $acquisition = $acquisition->excludeParents();
+        }
+
+        $stats = $acquisition->acquire($writer);
+        $config = $acquisition->configuration();
         $providerName = 'geneteka';
     } elseif ($command === 'wolyn') {
         $parish = required($options, 'parish');

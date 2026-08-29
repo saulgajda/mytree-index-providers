@@ -35,6 +35,7 @@ final class GenetekaProvider
         private readonly GenetekaMetadataParser $metadataParser = new GenetekaMetadataParser(),
         private readonly HtmlSelectParser $selectParser = new HtmlSelectParser(),
         private readonly ProgressReporterInterface $progress = new NullProgressReporter(),
+        private readonly GenetekaAvailabilityParser $availabilityParser = new GenetekaAvailabilityParser(),
     ) {
     }
 
@@ -125,6 +126,56 @@ final class GenetekaProvider
         return $result;
     }
 
+    public function acquisition(): GenetekaAcquisition
+    {
+        return new GenetekaAcquisition($this);
+    }
+
+    /**
+     * Discovers provider-specific record ids and year coverage exposed by the Geneteka UI.
+     *
+     * @return list<GenetekaRecordAvailability>
+     */
+    public function discoverAvailability(
+        string $region,
+        RecordType $anchorType,
+        string $anchorParishId,
+        bool $force = false,
+    ): array {
+        $region = trim($region);
+        $anchorParishId = trim($anchorParishId);
+        $this->providerTypeCode($anchorType);
+        if ($region === '' || $anchorParishId === '') {
+            throw new RuntimeException('Geneteka availability discovery requires region and parish id.');
+        }
+
+        [$anchorHtml, $anchorUrl] = $this->fetchAvailabilityPage($region, $anchorType, $anchorParishId, $force);
+        $ids = $this->availabilityParser->recordTypeIds($anchorHtml);
+        $ids[$anchorType->value] = $anchorParishId;
+
+        $result = [];
+        foreach ([RecordType::Birth, RecordType::Marriage, RecordType::Death] as $type) {
+            $rid = $ids[$type->value] ?? null;
+            if ($rid === null || $rid === '') {
+                continue;
+            }
+            if ($type === $anchorType && $rid === $anchorParishId) {
+                $html = $anchorHtml;
+                $url = $anchorUrl;
+            } else {
+                [$html, $url] = $this->fetchAvailabilityPage($region, $type, $rid, $force);
+            }
+            $result[] = new GenetekaRecordAvailability(
+                recordType: $type,
+                providerParishId: $rid,
+                yearRanges: $this->availabilityParser->yearRanges($html),
+                sourceUrl: $url,
+            );
+        }
+
+        return $result;
+    }
+
     /** @return array{0:string,1:string} */
     private function fetchIndexPage(?string $region, bool $force): array
     {
@@ -155,6 +206,44 @@ final class GenetekaProvider
             'http_status' => $response->status,
             'retrieved_at' => gmdate(DATE_ATOM),
             'region' => $region,
+        ]);
+        return [$response->body, $url];
+    }
+
+    /** @return array{0:string,1:string} */
+    private function fetchAvailabilityPage(string $region, RecordType $type, string $parishId, bool $force): array
+    {
+        $providerType = $this->providerTypeCode($type);
+        $url = self::INDEX_ENDPOINT . '?' . http_build_query([
+            'op' => 'gt',
+            'lang' => 'pol',
+            'bdm' => $providerType,
+            'w' => $region,
+            'rid' => $parishId,
+        ], '', '&', PHP_QUERY_RFC3986);
+        $cacheKey = "availability_{$region}_{$providerType}_{$parishId}";
+        $cached = !$force ? $this->rawStore->get('geneteka', $cacheKey, 'html') : null;
+        if ($cached !== null) {
+            return [$cached, $url];
+        }
+
+        $this->rateLimiter->beforeRequest();
+        $response = $this->http->get($url, [
+            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Referer' => self::INDEX_ENDPOINT,
+        ]);
+        if ($response->status < 200 || $response->status >= 300) {
+            throw new RuntimeException("Geneteka HTTP {$response->status}: $url");
+        }
+        $this->rawStore->put('geneteka', $cacheKey, 'html', $response->body, [
+            'provider' => 'geneteka',
+            'purpose' => 'record_availability',
+            'requested_url' => $url,
+            'http_status' => $response->status,
+            'retrieved_at' => gmdate(DATE_ATOM),
+            'region' => $region,
+            'record_type' => $type->value,
+            'parish_id' => $parishId,
         ]);
         return [$response->body, $url];
     }
@@ -223,87 +312,75 @@ final class GenetekaProvider
         return $result;
     }
 
-    /** @param list<RecordType> $types */
-    public function acquire(
-        string $region,
-        string $parishId,
-        ?string $parishName,
-        array $types,
-        RecordWriterInterface $writer,
-        int $pageSize = 50,
-        bool $force = false,
-    ): AcquisitionStats {
-        foreach ($types as $type) {
-            if (!$type instanceof RecordType) {
-                throw new RuntimeException('Geneteka record types must be RecordType enum values.');
-            }
-            $this->providerTypeCode($type);
-        }
-
+    /** @internal Executed by GenetekaAcquisition::acquire(). */
+    public function executeAcquisition(GenetekaAcquisition $acquisition, RecordWriterInterface $writer): AcquisitionStats
+    {
+        $region = $acquisition->regionCode();
+        $parishId = $acquisition->providerParishId();
+        $parishName = $acquisition->parishName();
+        $type = $acquisition->type();
+        $pageSize = $acquisition->configuredPageSize();
+        $force = $acquisition->isForced();
+        $fingerprint = $acquisition->fingerprint();
         $stats = new AcquisitionStats();
-        foreach ($types as $type) {
-            $this->acquireType($region, $parishId, $parishName, $type, $writer, $pageSize, $force, $stats);
-        }
-        return $stats;
-    }
 
-    private function acquireType(
-        string $region,
-        string $parishId,
-        ?string $parishName,
-        RecordType $type,
-        RecordWriterInterface $writer,
-        int $pageSize,
-        bool $force,
-        AcquisitionStats $stats,
-    ): void {
-        $metaKey = "geneteka:$region:$parishId:{$type->value}:meta";
+        $metaKey = "geneteka:query:$fingerprint:meta";
         $meta = $force ? null : $this->checkpoints->get($metaKey);
         $total = is_array($meta) && isset($meta['records_total']) ? (int) $meta['records_total'] : null;
         $firstPageConsumed = false;
 
         if ($total === null) {
-            $first = $this->fetchPage($region, $parishId, $type, 0, $pageSize, $stats, !$force);
-            $total = (int) ($first['recordsTotal'] ?? 0);
+            $first = $this->fetchPage($acquisition, 0, $stats, !$force);
+            $total = (int) ($first['recordsFiltered'] ?? $first['recordsTotal'] ?? 0);
             $this->checkpoints->set($metaKey, [
                 'records_total' => $total,
+                'records_total_unfiltered' => isset($first['recordsTotal']) ? (int) $first['recordsTotal'] : null,
                 'page_size' => $pageSize,
+                'query' => $acquisition->configuration(),
                 'updated_at' => gmdate(DATE_ATOM),
             ]);
-            $this->progress->info("Geneteka $region/$parishId {$type->value}: $total records.");
-            $this->consumePage($first, $region, $parishId, $parishName, $type, 0, $pageSize, $writer, $stats, $force);
+            $this->progress->info("Geneteka $region/$parishId {$type->value}: $total matching records.");
+            $this->consumePage($first, $acquisition, 0, $writer, $stats);
             $firstPageConsumed = true;
         }
 
         $pages = $total === 0 ? 0 : (int) ceil($total / $pageSize);
         for ($page = $firstPageConsumed ? 1 : 0; $page < $pages; $page++) {
-            $checkpointKey = "geneteka:$region:$parishId:{$type->value}:page:$page";
+            $checkpointKey = "geneteka:query:$fingerprint:page:$page";
             if (!$force && $this->checkpoints->get($checkpointKey) === true) {
                 $stats->skippedUnits++;
                 continue;
             }
-            if ($page === 0 && $this->checkpoints->get($checkpointKey) === true && !$force) {
-                continue;
-            }
-            $json = $this->fetchPage($region, $parishId, $type, $page, $pageSize, $stats, !$force);
-            $this->consumePage($json, $region, $parishId, $parishName, $type, $page, $pageSize, $writer, $stats, $force);
+            $json = $this->fetchPage($acquisition, $page, $stats, !$force);
+            $this->consumePage($json, $acquisition, $page, $writer, $stats);
         }
+
+        return $stats;
     }
 
     /** @return array<string,mixed> */
-    private function fetchPage(string $region, string $parishId, RecordType $type, int $page, int $pageSize, AcquisitionStats $stats, bool $useCache): array
+    private function fetchPage(GenetekaAcquisition $acquisition, int $page, AcquisitionStats $stats, bool $useCache): array
     {
+        $region = $acquisition->regionCode();
+        $parishId = $acquisition->providerParishId();
+        $type = $acquisition->type();
         $providerType = $this->providerTypeCode($type);
+        $pageSize = $acquisition->configuredPageSize();
         $start = $page * $pageSize;
-        $url = self::ENDPOINT . '?' . http_build_query([
+        $params = [
             'bdm' => $providerType,
             'w' => $region,
             'rid' => $parishId,
-            'length' => $pageSize,
-            'start' => $start,
-        ], '', '&', PHP_QUERY_RFC3986);
+        ];
+        foreach ($acquisition->providerFormParameters() as $name => $value) {
+            $params[$name] = $value;
+        }
+        $params['length'] = $pageSize;
+        $params['start'] = $start;
+        $url = self::ENDPOINT . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
 
-        $cacheKey = "{$region}_{$parishId}_{$providerType}_{$start}";
+        $fingerprint = $acquisition->fingerprint();
+        $cacheKey = "query_{$fingerprint}_{$start}";
         $cachedBody = $useCache ? $this->rawStore->get('geneteka', $cacheKey, 'json') : null;
         $cacheMeta = $useCache ? $this->rawStore->metadata('geneteka', $cacheKey, 'json') : null;
         if ($cachedBody !== null) {
@@ -316,7 +393,7 @@ final class GenetekaProvider
             $this->progress->info("Geneteka $region/$parishId {$type->value}: page " . ($page + 1) . " (start=$start).");
             $this->rateLimiter->beforeRequest();
             $response = $this->http->get($url, [
-                'Referer' => 'https://geneteka.genealodzy.pl/index.php',
+                'Referer' => self::INDEX_ENDPOINT,
                 'X-Requested-With' => 'XMLHttpRequest',
                 'Accept' => 'application/json,text/javascript,*/*;q=0.1',
             ]);
@@ -335,6 +412,8 @@ final class GenetekaProvider
                 'region' => $region,
                 'parish_id' => $parishId,
                 'record_type' => $type->value,
+                'form_parameters' => $acquisition->providerFormParameters(),
+                'query_fingerprint' => $fingerprint,
                 'start' => $start,
                 'length' => $pageSize,
             ]);
@@ -354,18 +433,14 @@ final class GenetekaProvider
     /** @param array<string,mixed> $json */
     private function consumePage(
         array $json,
-        string $region,
-        string $parishId,
-        ?string $parishName,
-        RecordType $type,
+        GenetekaAcquisition $acquisition,
         int $page,
-        int $pageSize,
         RecordWriterInterface $writer,
         AcquisitionStats $stats,
-        bool $force,
     ): void {
-        $checkpointKey = "geneteka:$region:$parishId:{$type->value}:page:$page";
-        if (!$force && $this->checkpoints->get($checkpointKey) === true) {
+        $fingerprint = $acquisition->fingerprint();
+        $checkpointKey = "geneteka:query:$fingerprint:page:$page";
+        if (!$acquisition->isForced() && $this->checkpoints->get($checkpointKey) === true) {
             return;
         }
 
@@ -375,18 +450,20 @@ final class GenetekaProvider
             }
             $writer->write($this->mapRecord(
                 $row,
-                $region,
-                $parishId,
-                $parishName,
-                $type,
+                $acquisition->regionCode(),
+                $acquisition->providerParishId(),
+                $acquisition->parishName(),
+                $acquisition->type(),
                 $page,
                 (int) $rowIndex,
                 (string) ($json['_mytree_request_url'] ?? ''),
                 (string) ($json['_mytree_raw_path'] ?? ''),
                 (string) ($json['_mytree_raw_sha256'] ?? ''),
                 (string) ($json['_mytree_retrieved_at'] ?? gmdate(DATE_ATOM)),
+                $fingerprint,
+                $acquisition->providerFormParameters(),
             ));
-            $stats->record($type->value);
+            $stats->record($acquisition->type()->value);
         }
 
         $this->checkpoints->set($checkpointKey, true);
@@ -405,6 +482,8 @@ final class GenetekaProvider
         string $rawPath,
         string $rawSha256,
         string $retrievedAt,
+        string $queryFingerprint,
+        array $formParameters,
     ): ExternalIndexRecord {
         $providerType = $this->providerTypeCode($type);
         $values = array_map(static fn (mixed $v): string => trim((string) $v), array_values($row));
@@ -414,7 +493,7 @@ final class GenetekaProvider
         $metadata = $this->metadataParser->parse($values[9]);
         $providerRecordId = isset($metadata['gid']) && $metadata['gid'] !== ''
             ? (string) $metadata['gid']
-            : hash('sha256', 'geneteka|' . $region . '|' . $parishId . '|' . $providerType . '|page:' . $page . '|row:' . $rowIndex . '|' . json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            : hash('sha256', 'geneteka|' . $region . '|' . $parishId . '|' . $providerType . '|' . json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
 
         if ($type === RecordType::Marriage) {
             $fields = [
@@ -476,6 +555,8 @@ final class GenetekaProvider
                 'region' => $region,
                 'parish_id' => $parishId,
                 'requested_parish_name' => $parishName,
+                'query_fingerprint' => $queryFingerprint,
+                'form_parameters' => $formParameters,
                 'page' => $page,
                 'row_index' => $rowIndex,
                 'request_url' => $requestUrl,
